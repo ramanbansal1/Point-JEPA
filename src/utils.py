@@ -36,9 +36,9 @@ def fourier_features_3d(xyz, num_bands=4, scale=1.0):
     
     return features
 
-def save_checkpoint(model, step, path="checkpoints"):
+def save_checkpoint(model, step, path="checkpoints", type_='jepa'):
     os.makedirs(path, exist_ok=True)
     torch.save(
         model.state_dict(),
-        f"{path}/jepa_step_{step}.pt"
+        f"{path}/{type_}_step_{step}.pt"
     )
