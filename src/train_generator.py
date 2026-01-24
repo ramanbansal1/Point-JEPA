@@ -8,6 +8,7 @@ from models import DualEncoder
 from data import ModelNetDataset, ModelNetConfig, jepa_collate_fn
 from tqdm import tqdm
 from utils import save_checkpoint
+from generator import PointGenerator
 
 @dataclass
 class TrainConfig:
@@ -107,8 +108,10 @@ def train_jepa(
     cfg: TrainConfig,
 ):
     device = torch.device(cfg.device)
-    model.to(device)
-    model.train()
+    encoder.to(device)
+    generator.to(device)
+    generator.train()
+    encoder.eval()
 
     loader = DataLoader(
         dataset,
@@ -120,7 +123,7 @@ def train_jepa(
     )
 
     optimizer = torch.optim.AdamW(
-        model.parameters(),
+        generator.parameters(),
         lr=1e-4,
         weight_decay=0.05
     )
@@ -156,18 +159,17 @@ def train_jepa(
                     xyz_targets=xyz_targets,
                     mode="train",
                 )
-            
+            print(out['pred_tokens'].shape)
 
             # here comes the generator with xyz_content, mask_centers, xyz_targets as targets and out {pred_tokens, target_tokens, ctx_xyz, tgt_xyz}
-
-
-
-            loss = jepa_loss(
-                pred_tokens=out["pred_tokens"],
-                target_tokens=out["target_tokens"],
-                ctx_xyz=out["ctx_xyz"],
-                tgt_xyz=out["tgt_xyz"],
+            data = generator(
+                out['ctx_xyz'],
+                out['ctx_tokens'],
+                out['pred_tokens']
             )
+
+
+            break
 
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
@@ -182,7 +184,7 @@ def train_jepa(
                 loss=f"{loss.item():.4f}"
             )
 
-        
+        break
         save_checkpoint(generator, step, type_='gen')
 
 
@@ -193,5 +195,6 @@ if __name__=='__main__':
     data_config = ModelNetConfig()
     train_cinfig = TrainConfig()
     dataset = ModelNetDataset(data_config)
-    model = DualEncoder()
-    train_jepa(model, dataset, train_cinfig)
+    encoder = DualEncoder()
+    generator = PointGenerator(token_dim=1024)
+    train_jepa(encoder,generator, dataset, train_cinfig)

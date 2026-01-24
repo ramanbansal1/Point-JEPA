@@ -333,6 +333,7 @@ class DualEncoder(nn.Module):
             "target_tokens": target_tokens,  # [B, M, P_t', C]
             "ctx_xyz": ctx_xyz,              # [B, P, 3]
             "tgt_xyz": tgt_xyz,              # list[M] of [B, P_t', 3]
+            "ctx_tokens": ctx_tokens         # [B, P, C]
         }
 
 

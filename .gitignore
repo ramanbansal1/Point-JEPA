@@ -1,0 +1,4 @@
+data/
+pytorch3d/
+
+*/__pycache__/
