@@ -1,117 +1,104 @@
 from dataclasses import dataclass
-from typing import Tuple, Optional
+from typing import Tuple
 import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
-from pytorch3d.ops.knn import knn_points
-from models import DualEncoder
-from data import ModelNetDataset, ModelNetConfig, jepa_collate_fn
 from tqdm import tqdm
-from utils import save_checkpoint
+import logging
+
+from pytorch3d.ops import knn_points
+from models import DualEncoder
+from gen_data import ModelNetDataset, ModelNetConfig
 from generator import PointGenerator
 
+logging.getLogger("trimesh").setLevel(logging.ERROR)
+
+# ==================================================
+# Train config (FAST, PRETRAINED ENCODER)
+# ==================================================
 @dataclass
 class TrainConfig:
-    # optimizer
-    lr: float = 1e-4                  # γ
-    weight_decay: float = 0.1         # λ
-    momentum: float = 0.95            # μ
-    nesterov: bool = True
-    ns_coefficients: Tuple[float, float, float] = (3.4445, -4.775, 2.0315)
-    ns_steps: int = 5
-    eps: float = 1e-7
+    lr: float = 3e-4
+    weight_decay: float = 0.01
 
-    # training
-    max_iters: int = 2_000
+    max_iters: int = 20_000
     batch_size: int = 8
     num_workers: int = 4
-    device: str = "cpu"
+    device: str = "cuda" if torch.cuda.is_available() else "cpu"
 
-    # EMA (JEPA)
-    ema_decay: float = 0.99
-
-    # early stopping (batch-level)
-    early_stop_patience: int = 200
-    early_stop_min_delta: float = 1e-4
-
-    # logging
     log_every: int = 50
 
 
-class BatchEarlyStopping:
-    def __init__(self, patience, min_delta):
-        self.patience = patience
-        self.min_delta = min_delta
-        self.best = float("inf")
-        self.counter = 0
+# ==================================================
+# Ultra-fast losses (ONE-SIDED + RADIUS, kNN-based)
+# ==================================================
 
-    def step(self, loss):
-        if loss < self.best - self.min_delta:
-            self.best = loss
-            self.counter = 0
-            return False
-        else:
-            self.counter += 1
-            return self.counter >= self.patience
-
-def build_muon_optimizer(model, cfg: TrainConfig):
-    return torch.optim.Muon(
-        params=model.parameters(),
-        lr=cfg.lr,
-        weight_decay=cfg.weight_decay,
-        momentum=cfg.momentum,
-        nesterov=cfg.nesterov,
-        ns_coefficients=cfg.ns_coefficients,
-        eps=cfg.eps,
-        ns_steps=cfg.ns_steps,
-        adjust_lr_fn=None,   # can be plugged later if needed
-    )
-
-
-def jepa_loss(pred_tokens, target_tokens, ctx_xyz, tgt_xyz):
+def one_sided_knn_loss(pred: torch.Tensor, gt: torch.Tensor, K: int = 1, subsample: int = 512):
     """
-    Ragged JEPA loss (matches current DualEncoder.forward)
+    ONE-SIDED Chamfer (pred -> gt only), fastest stable loss
     """
-    B, M, P_ctx, C = pred_tokens.shape
-    loss = 0.0
-    count = 0
+    if pred.numel() == 0 or gt.numel() == 0:
+        return pred.new_tensor(0.0)
 
-    for b in range(B):
-        ctx_pts = ctx_xyz[b]              # [P_ctx, 3]
+    if pred.shape[0] > subsample:
+        pred = pred[torch.randperm(pred.shape[0], device=pred.device)[:subsample]]
+    if gt.shape[0] > subsample:
+        gt = gt[torch.randperm(gt.shape[0], device=gt.device)[:subsample]]
 
-        for m in range(M):
-            tgt_pts = tgt_xyz[b][m]       # [P_t', 3]
-            tgt_tok = target_tokens[b][m] # [P_t', C]
-            pred_tok = pred_tokens[b, m]  # [P_ctx, C]
+    pred = pred.unsqueeze(0)
+    gt = gt.unsqueeze(0)
 
-            # knn_points requires batch dimension
-            _, idx, _ = knn_points(
-                ctx_pts.unsqueeze(0),     # [1, P_ctx, 3]
-                tgt_pts.unsqueeze(0),     # [1, P_t', 3]
-                K=1,
-            )
-
-            idx = idx.squeeze(0).squeeze(-1)  # [P_ctx]
-
-            aligned_target = tgt_tok[idx]     # [P_ctx, C]
-
-            loss += F.mse_loss(pred_tok, aligned_target)
-            count += 1
-
-    return loss / count
+    d, _, _ = knn_points(pred, gt, K=K)
+    return d.mean()
 
 
-def train_jepa(
-    encoder,
-    generator,
-    dataset,
+def radius_loss(pred: torch.Tensor, gt: torch.Tensor, radius: float = 0.05, subsample: int = 512):
+    """
+    Extremely fast coverage loss using radius queries
+    Penalizes points with no GT neighbor within radius
+    """
+    from pytorch3d.ops import ball_query
+
+    if pred.numel() == 0 or gt.numel() == 0:
+        return pred.new_tensor(0.0)
+
+    if pred.shape[0] > subsample:
+        pred = pred[torch.randperm(pred.shape[0], device=pred.device)[:subsample]]
+    if gt.shape[0] > subsample:
+        gt = gt[torch.randperm(gt.shape[0], device=gt.device)[:subsample]]
+
+    pred = pred.unsqueeze(0)
+    gt = gt.unsqueeze(0)
+
+    idx, _, _ = ball_query(pred, gt, radius=radius, K=1)
+    return (idx < 0).float().mean()
+
+
+# ==================================================
+# Training loop
+# ==================================================
+
+def train(
+    encoder: DualEncoder,
+    generator: PointGenerator,
+    dataset: ModelNetDataset,
     cfg: TrainConfig,
 ):
     device = torch.device(cfg.device)
+
+    # ----------------------------
+    # Encoder: frozen teacher
+    # ----------------------------
     encoder.to(device)
+    encoder.eval()
+    for p in encoder.parameters():
+        p.requires_grad_(False)
+
+    # ----------------------------
+    # Generator: trainable
+    # ----------------------------
     generator.to(device)
     generator.train()
-    encoder.eval()
 
     loader = DataLoader(
         dataset,
@@ -119,82 +106,114 @@ def train_jepa(
         shuffle=True,
         num_workers=cfg.num_workers,
         drop_last=True,
-        collate_fn=jepa_collate_fn,
+        pin_memory=True,
     )
 
     optimizer = torch.optim.AdamW(
         generator.parameters(),
-        lr=1e-4,
-        weight_decay=0.05
-    )
-
-    early_stopper = BatchEarlyStopping(
-        cfg.early_stop_patience,
-        cfg.early_stop_min_delta,
+        lr=cfg.lr,
+        weight_decay=cfg.weight_decay,
     )
 
     step = 0
+    pbar = tqdm(total=cfg.max_iters, desc="Training generator (FAST)")
 
     while step < cfg.max_iters:
-        pbar = tqdm(loader, desc=f"JEPA training", leave=False)
-        for batch in pbar:
-            if batch is None:
-                continue
+        for batch in loader:
             if step >= cfg.max_iters:
                 break
 
-            xyz_context = batch["context"].to(device)        # [B, Nc, 3]
-            mask_centers = batch["mask_centers"].to(device) # [B, M, 3]
+            # ----------------------------
+            # Batch unpack
+            # ----------------------------
+            ctx_xyz = batch["context_xyz"].to(device)   # [B, Nc, 3]
+            tgt_xyz = batch["target_xyz"].to(device)    # [B, Nt, 3]
+            mask_centers = batch["mask_center"].to(device)  # [B, 3]
 
-            # targets is now a list of length B
-            xyz_targets = [
-                [pcd.to(device) for pcd in sample_targets]
-                for sample_targets in batch["targets"]
-            ]
+            B, Nc, _ = ctx_xyz.shape
+            Nt = tgt_xyz.shape[1]
 
+            # ----------------------------
+            # DualEncoder inputs (single mask)
+            # ----------------------------
+            mask_centers = mask_centers.unsqueeze(1)      # [B, 1, 3]
+            xyz_targets = [[tgt_xyz[b]] for b in range(B)]
+
+            # ----------------------------
+            # Encode (teacher, no grad)
+            # ----------------------------
             with torch.no_grad():
-                out = encoder(
-                    xyz_context=xyz_context,
+                enc_out = encoder(
+                    xyz_context=ctx_xyz,
                     mask_centers=mask_centers,
                     xyz_targets=xyz_targets,
                     mode="train",
                 )
-            print(out['pred_tokens'].shape)
 
-            # here comes the generator with xyz_content, mask_centers, xyz_targets as targets and out {pred_tokens, target_tokens, ctx_xyz, tgt_xyz}
-            data = generator(
-                out['ctx_xyz'],
-                out['ctx_tokens'],
-                out['pred_tokens']
+            # ----------------------------
+            # Generator forward
+            # ----------------------------
+            gen_xyz = generator(
+                enc_out["ctx_xyz"],
+                enc_out["ctx_tokens"],
+                enc_out["pred_tokens"],
             )
 
+            gen_xyz = gen_xyz.view(B, -1, 3)
 
-            break
+            # split prediction
+            if gen_xyz.shape[1] < Nc + Nt:
+                continue
 
+            pred_ctx = gen_xyz[:, :Nc]
+            pred_tgt = gen_xyz[:, Nc:Nc + Nt]
+
+            # ----------------------------
+            # Losses (TARGET dominates)
+            # ----------------------------
+            loss = 0.0
+            for b in range(B):
+                # target completion (FAST)
+                loss += one_sided_knn_loss(pred_tgt[b], tgt_xyz[b])
+
+                # light context regularization
+                loss += 0.05 * one_sided_knn_loss(pred_ctx[b], ctx_xyz[b])
+
+            loss = loss / B
+
+            # ----------------------------
+            # Backprop
+            # ----------------------------
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
+            torch.nn.utils.clip_grad_norm_(generator.parameters(), 1.0)
             optimizer.step()
 
-            if early_stopper.step(loss.item()):
-                print(f"Early stopping at step {step}")
-                return
+            # ----------------------------
+            # Logging
+            # ----------------------------
+            if step % cfg.log_every == 0:
+                pbar.set_postfix(loss=f"{loss.item():.4f}")
 
-            pbar.set_postfix(
-                step=step,
-                loss=f"{loss.item():.4f}"
-            )
+            step += 1
+            pbar.update(1)
 
-        break
-        save_checkpoint(generator, step, type_='gen')
-
-
-        step += 1
+    pbar.close()
 
 
-if __name__=='__main__':
-    data_config = ModelNetConfig()
-    train_cinfig = TrainConfig()
-    dataset = ModelNetDataset(data_config)
+# ==================================================
+# Entry
+# ==================================================
+if __name__ == "__main__":
+    data_cfg = ModelNetConfig()
+    train_cfg = TrainConfig()
+
+    dataset = ModelNetDataset(data_cfg)
+
     encoder = DualEncoder()
-    generator = PointGenerator(token_dim=1024)
-    train_jepa(encoder,generator, dataset, train_cinfig)
+    ckpt = torch.load("checkpoints/jepa_step_4_.pt", map_location="cpu")
+    encoder.load_state_dict(ckpt, strict=False)
+
+    generator = PointGenerator(token_dim=data_cfg.token_dim)
+
+    train(encoder, generator, dataset, train_cfg)

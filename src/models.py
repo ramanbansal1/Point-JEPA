@@ -224,7 +224,6 @@ class LatentPredictor(nn.Module):
 
         returns    : [B, M, P, C]
         """
-
         B, P, C = ctx_tokens.shape
         M = mask_cond.shape[1]
 
@@ -408,7 +407,6 @@ class RecursivePointGenerator(nn.Module):
 
         # ---- collapse mask dimension ----
         tokens = pred_tokens.mean(dim=1)   # [B, 32, C]
-        print(tokens.shape)
         xyz = ctx_xyz                      # [B, 32, 3]
 
         for r in self.upsample_factors:

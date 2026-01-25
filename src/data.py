@@ -278,6 +278,7 @@ def generate_jepa_masks(
     target_pcs = [pc[m] for m in masks]
 
     return context_pc, target_pcs, centers
+
 class ModelNetDataset(Dataset):
     def __init__(self, config: ModelNetConfig):
         self.cfg = config
