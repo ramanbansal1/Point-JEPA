@@ -1,7 +1,31 @@
 import torch
 import torch.nn as nn
-from torch_geometric.nn import DynamicEdgeConv, knn_graph, EdgeConv
+from torch_geometric.nn import DynamicEdgeConv, EdgeConv, knn_graph
 
+# ==================================================
+# 1. Latent-to-XYZ Seed Generator
+#    (geometry is decoded from tokens)
+# ==================================================
+class LatentXYZGenerator(nn.Module):
+    def __init__(self, token_dim):
+        super().__init__()
+        self.mlp = nn.Sequential(
+            nn.Linear(token_dim, token_dim),
+            nn.ReLU(),
+            nn.Linear(token_dim, 3)
+        )
+
+    def forward(self, tokens):
+        """
+        tokens : [B, P, C]
+        return : [B, P, 3]
+        """
+        return self.mlp(tokens)
+
+
+# ==================================================
+# 2. Upsampler Block
+# ==================================================
 class Upsampler(nn.Module):
     def __init__(self, up_rate=4, noise_scale=0.02):
         super().__init__()
@@ -18,20 +42,27 @@ class Upsampler(nn.Module):
         return xyz_up + noise
 
 
+# ==================================================
+# 3. Token Assignment Block
+# ==================================================
 class TokenAssigner(nn.Module):
     def __init__(self, up_rate=4):
         super().__init__()
         self.up_rate = up_rate
 
-    def forward(self, ctx_tokens):
+    def forward(self, tokens):
         """
-        ctx_tokens : [B, P, C]
-        return     : [B, P*up_rate, C]
+        tokens : [B, P, C]
+        return : [B, P*up_rate, C]
         """
-        return ctx_tokens.repeat_interleave(self.up_rate, dim=1)
+        return tokens.repeat_interleave(self.up_rate, dim=1)
 
 
-class SharedEdgeConv(nn.Module):
+# ==================================================
+# 4. Shared Dynamic EdgeConv Block
+#    (feature-space neighborhoods, shared)
+# ==================================================
+class SharedDynamicEdgeConv(nn.Module):
     def __init__(
         self,
         in_channels: int,
@@ -43,7 +74,6 @@ class SharedEdgeConv(nn.Module):
     ):
         super().__init__()
 
-        # ---- First Dynamic EdgeConv ----
         self.conv1 = DynamicEdgeConv(
             nn=nn.Sequential(
                 nn.Linear(2 * in_channels, hidden_channels),
@@ -54,7 +84,6 @@ class SharedEdgeConv(nn.Module):
             aggr=aggr,
         )
 
-        # ---- Second Dynamic EdgeConv ----
         self.conv2 = DynamicEdgeConv(
             nn=nn.Sequential(
                 nn.Linear(2 * hidden_channels, out_channels),
@@ -67,33 +96,32 @@ class SharedEdgeConv(nn.Module):
 
     def forward(self, x):
         """
-        x : [N, C_in]
+        x : [N, C]
         """
-        x = self.conv1(x)   # [N, hidden_channels]
-        x = self.conv2(x)   # [N, out_channels]
+        x = self.conv1(x)
+        x = self.conv2(x)
         return x
 
 
-# --------------------------------------------------
-# Context Deformer (light, stabilizing)
-# --------------------------------------------------
+# ==================================================
+# 5. Context Deformer (light, stabilizing)
+# ==================================================
 class ContextDeformer(nn.Module):
     def __init__(self, token_dim):
         super().__init__()
         self.mlp = nn.Sequential(
-            nn.Linear(token_dim // 4, token_dim // 4),
+            nn.Linear(token_dim, token_dim // 2),
             nn.ReLU(),
-            nn.Linear(token_dim // 4, 3)
+            nn.Linear(token_dim // 2, 3)
         )
 
-    def forward(self, xyz, token):
-        offset = 0.05 * self.mlp(token)
-        return xyz + offset
+    def forward(self, xyz, feat):
+        return xyz + 0.05 * self.mlp(feat)
 
 
-# --------------------------------------------------
-# Folding-style MLP (target generation)
-# --------------------------------------------------
+# ==================================================
+# 6. Folding-style MLP (target generation)
+# ==================================================
 class FoldingMLP(nn.Module):
     def __init__(self, token_dim):
         super().__init__()
@@ -109,16 +137,16 @@ class FoldingMLP(nn.Module):
         return xyz + self.mlp(torch.cat([xyz, feat], dim=-1))
 
 
-# --------------------------------------------------
-# GNN-based local refinement
-# --------------------------------------------------
+# ==================================================
+# 7. GNN Refinement Block (XYZ-based, last stage)
+# ==================================================
 class GNNRefiner(nn.Module):
     def __init__(self, token_dim, k=16):
         super().__init__()
         self.k = k
         self.edgeconv = EdgeConv(
             nn.Sequential(
-                nn.Linear(2 * token_dim + 3, token_dim),
+                nn.Linear(2 * (token_dim + 3), token_dim),
                 nn.ReLU(),
                 nn.Linear(token_dim, 3)
             ),
@@ -130,40 +158,61 @@ class GNNRefiner(nn.Module):
         x = torch.cat([feat, xyz], dim=-1)
         return xyz + self.edgeconv(x, edge_index)
 
-# --------------------------------------------------
-# Generator using CONTEXT TOKENS + PREDICTED XYZ
-# --------------------------------------------------
+
+# ==================================================
+# 8. Generator
+#    INPUT SIGNATURE MATCHES:
+#    generator(ctx_xyz, ctx_tokens, pred_tokens)
+# ==================================================
 class PointGenerator(nn.Module):
     def __init__(self, token_dim, up_rate=4):
         super().__init__()
+        self.latent_xyz = LatentXYZGenerator(token_dim)
         self.upsampler = Upsampler(up_rate)
         self.assigner = TokenAssigner(up_rate)
-        self.shared_edgeconv = SharedEdgeConv(token_dim, token_dim // 2, token_dim // 4)
-        self.context_def = ContextDeformer(token_dim)
-        self.folding = FoldingMLP(token_dim)
-        self.refiner = GNNRefiner(token_dim)
 
-    def forward(self, ctx_xyz, ctx_tokens, pred_xyz, pred_token):
-        """
-        ctx_xyz    : [B, P, 3]
-        ctx_tokens : [B, P, C]
-        pred_xyz   : [B, P, 3]
-        """
-        B, P, C = ctx_tokens.shape
+        self.shared_dynconv = SharedDynamicEdgeConv(
+            token_dim,
+            token_dim // 2,
+            token_dim // 4,
+        )
 
-        # ---- Context path ----
-        ctx_xyz_f = ctx_xyz.view(-1, 3)
+        self.context_def = ContextDeformer(token_dim // 4)
+        self.folding = FoldingMLP(token_dim // 4)
+        self.refiner = GNNRefiner(token_dim // 4)
+
+    def forward(self, ctx_xyz, ctx_tokens, pred_tokens, mask_id=0):
+        """
+        ctx_xyz     : [B, P, 3]
+        ctx_tokens  : [B, P, C]          (context tokens)
+        pred_tokens : [B, M, P, C]
+        mask_id     : which mask to generate
+        """
+        B, M, P, C = pred_tokens.shape
+
+        # ---- select ONE mask ----
+        pred_tok_m = pred_tokens[:, mask_id]          # [B, P, C]
+
+        # ---- generate seed xyz from predicted tokens ----
+        seed_xyz = self.latent_xyz(pred_tok_m)        # [B, P, 3]
+
+        # ---- Context path (anchored) ----
+        ctx_xyz_f = ctx_xyz.reshape(-1, 3)
         ctx_tok_f = ctx_tokens.reshape(-1, C)
-        ctx_feat = self.shared_edgeconv(ctx_tok_f)
+
+        ctx_feat = self.shared_dynconv(ctx_tok_f)
         ctx_xyz_out = self.context_def(ctx_xyz_f, ctx_feat)
 
         # ---- Target path ----
-        tgt_xyz = self.upsampler(pred_xyz).view(-1, 3)
-        tgt_tok = self.assigner(ctx_tokens).view(-1, C)
+        tgt_xyz = self.upsampler(seed_xyz)             # [B, P*up, 3]
+        tgt_xyz_f = tgt_xyz.reshape(-1, 3)
 
-        tgt_feat = self.shared_edgeconv(tgt_xyz, tgt_tok)
-        tgt_xyz = self.folding(tgt_xyz, tgt_feat)
-        tgt_xyz = self.refiner(tgt_xyz, tgt_feat)
+        tgt_tok = self.assigner(pred_tok_m)            # [B, P*up, C]
+        tgt_tok_f = tgt_tok.reshape(-1, C)
 
+        tgt_feat = self.shared_dynconv(tgt_tok_f)
+        tgt_xyz_f = self.folding(tgt_xyz_f, tgt_feat)
+        tgt_xyz_f = self.refiner(tgt_xyz_f, tgt_feat)
+        print(ctx_xyz_out.shape, tgt_xyz_f.shape)
         # ---- Join ----
-        return torch.cat([ctx_xyz_out, tgt_xyz], dim=0)
+        return torch.cat([ctx_xyz_out, tgt_xyz_f], dim=0)
