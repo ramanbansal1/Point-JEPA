@@ -10,7 +10,6 @@ from pytorch3d.ops import knn_points
 from models import DualEncoder
 from gen_data import ModelNetDataset, ModelNetConfig
 from generator import PointGenerator
-
 logging.getLogger("trimesh").setLevel(logging.ERROR)
 
 # ==================================================
@@ -30,48 +29,39 @@ class TrainConfig:
 
 
 # ==================================================
-# Ultra-fast losses (ONE-SIDED + RADIUS, kNN-based)
+# FPS-based Hierarchical Chamfer (FAST + STABLE)
 # ==================================================
 
-def one_sided_knn_loss(pred: torch.Tensor, gt: torch.Tensor, K: int = 1, subsample: int = 512):
+from pytorch3d.ops import sample_farthest_points
+
+
+def fps_one_sided_cd(pred: torch.Tensor, gt: torch.Tensor, n_samples: int):
     """
-    ONE-SIDED Chamfer (pred -> gt only), fastest stable loss
+    One-sided Chamfer using FPS subsampling (pred -> gt)
+    pred, gt : [N,3], [M,3]
     """
     if pred.numel() == 0 or gt.numel() == 0:
         return pred.new_tensor(0.0)
 
-    if pred.shape[0] > subsample:
-        pred = pred[torch.randperm(pred.shape[0], device=pred.device)[:subsample]]
-    if gt.shape[0] > subsample:
-        gt = gt[torch.randperm(gt.shape[0], device=gt.device)[:subsample]]
-
     pred = pred.unsqueeze(0)
     gt = gt.unsqueeze(0)
 
-    d, _, _ = knn_points(pred, gt, K=K)
+    # FPS subsample
+    pred_fps, _ = sample_farthest_points(pred, K=min(n_samples, pred.shape[1]))
+    gt_fps, _ = sample_farthest_points(gt, K=min(n_samples, gt.shape[1]))
+
+    d, _, _ = knn_points(pred_fps, gt_fps, K=1)
     return d.mean()
 
 
-def radius_loss(pred: torch.Tensor, gt: torch.Tensor, radius: float = 0.05, subsample: int = 512):
+def hierarchical_fps_cd(pred: torch.Tensor, gt: torch.Tensor, levels=(128, 256, 512)):
     """
-    Extremely fast coverage loss using radius queries
-    Penalizes points with no GT neighbor within radius
+    Multi-scale FPS Chamfer (coarse -> fine)
     """
-    from pytorch3d.ops import ball_query
-
-    if pred.numel() == 0 or gt.numel() == 0:
-        return pred.new_tensor(0.0)
-
-    if pred.shape[0] > subsample:
-        pred = pred[torch.randperm(pred.shape[0], device=pred.device)[:subsample]]
-    if gt.shape[0] > subsample:
-        gt = gt[torch.randperm(gt.shape[0], device=gt.device)[:subsample]]
-
-    pred = pred.unsqueeze(0)
-    gt = gt.unsqueeze(0)
-
-    idx, _, _ = ball_query(pred, gt, radius=radius, K=1)
-    return (idx < 0).float().mean()
+    loss = 0.0
+    for k in levels:
+        loss += fps_one_sided_cd(pred, gt, n_samples=k)
+    return loss / len(levels)
 
 
 # ==================================================
@@ -85,7 +75,6 @@ def train(
     cfg: TrainConfig,
 ):
     device = torch.device(cfg.device)
-
     # ----------------------------
     # Encoder: frozen teacher
     # ----------------------------
@@ -174,10 +163,11 @@ def train(
             loss = 0.0
             for b in range(B):
                 # target completion (FAST)
-                loss += one_sided_knn_loss(pred_tgt[b], tgt_xyz[b])
+                # hierarchical target completion
+                loss += hierarchical_fps_cd(pred_tgt[b], tgt_xyz[b])
 
-                # light context regularization
-                loss += 0.05 * one_sided_knn_loss(pred_ctx[b], ctx_xyz[b])
+                # light context regularization (coarse only)
+                loss += 0.05 * fps_one_sided_cd(pred_ctx[b], ctx_xyz[b], n_samples=128)
 
             loss = loss / B
 
@@ -211,7 +201,7 @@ if __name__ == "__main__":
     dataset = ModelNetDataset(data_cfg)
 
     encoder = DualEncoder()
-    ckpt = torch.load("checkpoints/jepa_step_4_.pt", map_location="cpu")
+    ckpt = torch.load("/home/raman/Desktop/Projects/Point-JEPA/checkpoints/jepa_step_4_.pt", map_location="cpu")
     encoder.load_state_dict(ckpt, strict=False)
 
     generator = PointGenerator(token_dim=data_cfg.token_dim)
