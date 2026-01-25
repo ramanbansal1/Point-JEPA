@@ -1,4 +1,5 @@
 data/
 pytorch3d/
 
-*/__pycache__/
+app/external/
+app/depth_anything_v2/
