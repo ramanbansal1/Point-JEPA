@@ -9,7 +9,7 @@ import logging
 from pytorch3d.ops import knn_points
 from encoder.models import DualEncoder
 from generator.gen_data import ModelNetDataset, ModelNetConfig
-from generator.generator import PointGenerator
+from generator.test_model import PointGenerator
 
 logging.getLogger("trimesh").setLevel(logging.ERROR)
 
@@ -41,7 +41,6 @@ def chamfer_cdist(x, y):
     x: [B, N, 3]
     y: [B, M, 3]
     """
-    print(x.shape, y.shape)
     # [B, N, M]
     dists = torch.cdist(x, y, p=2) ** 2
 
@@ -132,13 +131,10 @@ def train(
             # Generator forward
             # ----------------------------
             gen_xyz = generator(
-                enc_out["ctx_xyz"],
                 enc_out["ctx_tokens"],
                 enc_out["pred_tokens"],
             )
             gen_xyz = gen_xyz.view(B, -1, 3)
-            print(gen_xyz.shape)
-            print(Nc, Nt)
             # split prediction
             if gen_xyz.shape[1] < Nc + Nt:
                 continue
@@ -149,13 +145,7 @@ def train(
             # ----------------------------
             # Losses (TARGET dominates)
             # ----------------------------
-            loss = 0.0
-            for b in range(B):
-                # target completion (FAST)
-                # hierarchical target completion
-                loss += chamfer_cdist(pred_tgt[b], tgt_xyz[b])
-
-            loss = loss / B
+            loss = chamfer_cdist(pred_tgt, tgt_xyz) 
 
             # ----------------------------
             # Backprop
