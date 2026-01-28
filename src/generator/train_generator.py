@@ -9,7 +9,8 @@ import logging
 from pytorch3d.ops import knn_points
 from encoder.models import DualEncoder
 from generator.gen_data import ModelNetDataset, ModelNetConfig
-from generator import PointGenerator
+from generator.generator import PointGenerator
+
 logging.getLogger("trimesh").setLevel(logging.ERROR)
 
 # ==================================================
@@ -35,33 +36,21 @@ class TrainConfig:
 from pytorch3d.ops import sample_farthest_points
 
 
-def fps_one_sided_cd(pred: torch.Tensor, gt: torch.Tensor, n_samples: int):
+def chamfer_cdist(x, y):
     """
-    One-sided Chamfer using FPS subsampling (pred -> gt)
-    pred, gt : [N,3], [M,3]
+    x: [B, N, 3]
+    y: [B, M, 3]
     """
-    if pred.numel() == 0 or gt.numel() == 0:
-        return pred.new_tensor(0.0)
+    print(x.shape, y.shape)
+    # [B, N, M]
+    dists = torch.cdist(x, y, p=2) ** 2
 
-    pred = pred.unsqueeze(0)
-    gt = gt.unsqueeze(0)
+    # pred -> gt
+    min_xy = dists.min(dim=2)[0]   # [B, N]
+    # gt -> pred
+    min_yx = dists.min(dim=1)[0]   # [B, M]
 
-    # FPS subsample
-    pred_fps, _ = sample_farthest_points(pred, K=min(n_samples, pred.shape[1]))
-    gt_fps, _ = sample_farthest_points(gt, K=min(n_samples, gt.shape[1]))
-
-    d, _, _ = knn_points(pred_fps, gt_fps, K=1)
-    return d.mean()
-
-
-def hierarchical_fps_cd(pred: torch.Tensor, gt: torch.Tensor, levels=(128, 256, 512)):
-    """
-    Multi-scale FPS Chamfer (coarse -> fine)
-    """
-    loss = 0.0
-    for k in levels:
-        loss += fps_one_sided_cd(pred, gt, n_samples=k)
-    return loss / len(levels)
+    return min_xy.mean() + min_yx.mean()
 
 
 # ==================================================
@@ -95,7 +84,7 @@ def train(
         shuffle=True,
         num_workers=cfg.num_workers,
         drop_last=True,
-        pin_memory=True,
+        pin_memory=(cfg.device == "cuda"),
     )
 
     optimizer = torch.optim.AdamW(
@@ -147,9 +136,9 @@ def train(
                 enc_out["ctx_tokens"],
                 enc_out["pred_tokens"],
             )
-
             gen_xyz = gen_xyz.view(B, -1, 3)
-
+            print(gen_xyz.shape)
+            print(Nc, Nt)
             # split prediction
             if gen_xyz.shape[1] < Nc + Nt:
                 continue
@@ -164,10 +153,7 @@ def train(
             for b in range(B):
                 # target completion (FAST)
                 # hierarchical target completion
-                loss += hierarchical_fps_cd(pred_tgt[b], tgt_xyz[b])
-
-                # light context regularization (coarse only)
-                loss += 0.05 * fps_one_sided_cd(pred_ctx[b], ctx_xyz[b], n_samples=128)
+                loss += chamfer_cdist(pred_tgt[b], tgt_xyz[b])
 
             loss = loss / B
 
@@ -182,8 +168,7 @@ def train(
             # ----------------------------
             # Logging
             # ----------------------------
-            if step % cfg.log_every == 0:
-                pbar.set_postfix(loss=f"{loss.item():.4f}")
+            pbar.set_postfix(loss=f"{loss.item():.4f}")
 
             step += 1
             pbar.update(1)

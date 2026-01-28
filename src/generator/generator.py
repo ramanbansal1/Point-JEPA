@@ -84,6 +84,38 @@ class TargetDynamicEdgeConv(nn.Module):
         x = self.conv2(x)
         return x
 
+class TargetEdgeConv(nn.Module):
+    def __init__(self, in_channels, hidden_channels, out_channels, k=16):
+        super().__init__()
+        self.k = k
+
+        self.edgeconv1 = EdgeConv(
+            nn.Sequential(
+                nn.Linear(2 * in_channels, hidden_channels),
+                nn.ReLU(),
+                nn.Linear(hidden_channels, hidden_channels),
+            ),
+            aggr="max",
+        )
+
+        self.edgeconv2 = EdgeConv(
+            nn.Sequential(
+                nn.Linear(2 * hidden_channels, out_channels),
+                nn.ReLU(),
+                nn.Linear(out_channels, out_channels),
+            ),
+            aggr="max",
+        )
+
+    def forward(self, xyz, feat):
+        # xyz : [N, 3]
+        # feat: [N, C]
+        edge_index = knn_graph(xyz, k=self.k, loop=False)
+
+        x = self.edgeconv1(feat, edge_index)
+        x = self.edgeconv2(x, edge_index)
+        return x
+
 
 # ==================================================
 # 5. Context EdgeConv Block (XYZ-based, stable)
@@ -202,8 +234,19 @@ class ContextUpsampler(nn.Module):
 # 9. Generator
 # ==================================================
 class PointGenerator(nn.Module):
-    def __init__(self, token_dim, up_rate=4, grid_size=4, ctx_up_rate=2):
+    def __init__(
+        self,
+        token_dim,
+        up_rate=4,
+        grid_size=4,
+        ctx_up_rate=2,
+        target_ctx_points=1024,
+        target_tgt_points=6048,
+    ):
         super().__init__()
+
+        self.target_ctx_points = target_ctx_points
+        self.target_tgt_points = target_tgt_points
 
         # ---------- Context ----------
         self.context_upsampler = ContextUpsampler(ctx_up_rate)
@@ -214,53 +257,83 @@ class PointGenerator(nn.Module):
         self.latent_xyz = LatentXYZGenerator(token_dim)
         self.upsampler = Upsampler(up_rate)
         self.assigner = TokenAssigner(up_rate)
-        self.target_dynconv = TargetDynamicEdgeConv(
+
+        self.target_edgeconv = TargetEdgeConv(
             token_dim,
             token_dim // 2,
             token_dim // 4,
         )
+
+
         self.folding = FoldingMLP(token_dim // 4)
         self.refiner = GNNRefiner(token_dim // 4)
 
         # fixed 2D folding grid
-        grid = torch.stack(torch.meshgrid(
-            torch.linspace(-1, 1, grid_size),
-            torch.linspace(-1, 1, grid_size),
-            indexing="ij"
-        ), dim=-1).view(-1, 2)
+        grid = torch.stack(
+            torch.meshgrid(
+                torch.linspace(-1, 1, grid_size),
+                torch.linspace(-1, 1, grid_size),
+                indexing="ij",
+            ),
+            dim=-1,
+        ).view(-1, 2)
         self.register_buffer("fold_grid", grid)
 
+        
+
     def forward(self, ctx_xyz, ctx_tokens, pred_tokens, mask_id=0):
-        B, M, P, C = pred_tokens.shape
+        """
+        ctx_xyz     : [B, P_ctx0, 3]
+        ctx_tokens  : [B, P_ctx0, C]
+        pred_tokens : [B, M, P_pred, C]
+        """
+        B, M, P_pred, C = pred_tokens.shape
+        print('start *')
 
-        # ================= Context =================
-        # decoded canonical context → resolution alignment
-        ctx_xyz = self.context_upsampler(ctx_xyz)           # [B, P_ctx, 3]
-        ctx_tokens = ctx_tokens.repeat_interleave(
-            self.context_upsampler.up_rate, dim=1
-        )
-
+        # ==================================================
+        # Context path (GEOMETRY ONLY)
+        # ==================================================
+        while ctx_xyz.shape[1] < self.target_ctx_points:
+            ctx_xyz = self.context_upsampler(ctx_xyz)
+            ctx_tokens = ctx_tokens.repeat_interleave(
+                self.context_upsampler.up_rate, dim=1
+            )
+        ctx_xyz = ctx_xyz[:, : self.target_ctx_points]
+        ctx_tokens = ctx_tokens[:, : self.target_ctx_points]
         ctx_xyz_f = ctx_xyz.reshape(-1, 3)
         ctx_tok_f = ctx_tokens.reshape(-1, C)
-
         ctx_feat = self.context_edgeconv(ctx_xyz_f, ctx_tok_f)
         ctx_xyz_out = self.context_def(ctx_xyz_f, ctx_feat)
+        # ==================================================
+        # Target path (GENERATION + LOOPED UPSAMPLING)
+        # ==================================================
+        pred_tok = pred_tokens[:, mask_id]      # [B, P_pred, C]
+        
+        # seed geometry
+        tgt_xyz = self.latent_xyz(pred_tok)     # [B, P_pred, 3]
+        tgt_tok = pred_tok
+        # iterative upsampling until target resolution
+        while tgt_xyz.shape[1] < self.target_tgt_points:
+            tgt_xyz = self.upsampler(tgt_xyz)
+            tgt_tok = self.assigner(tgt_tok)
+        tgt_xyz = tgt_xyz[:, : self.target_tgt_points]
+        tgt_tok = tgt_tok[:, : self.target_tgt_points]
 
-        # ================= Target =================
-        pred_tok = pred_tokens[:, mask_id]                  # [B, P, C]
-        seed_xyz = self.latent_xyz(pred_tok)                # object-frame seeds
+        tgt_xyz_f = tgt_xyz.reshape(-1, 3)
+        tgt_tok_f = tgt_tok.reshape(-1, C)
+        print("finish 1")
+        # feature-space neighborhood
+        tgt_feat = self.target_edgeconv(tgt_xyz_f, tgt_tok_f)
 
-        tgt_xyz = self.upsampler(seed_xyz).reshape(-1, 3)
-        tgt_tok = self.assigner(pred_tok).reshape(-1, C)
-
-        tgt_feat = self.target_dynconv(tgt_tok)
-
+        # folding
         grid = self.fold_grid.repeat(
             tgt_feat.shape[0] // self.fold_grid.shape[0] + 1, 1
-        )[:tgt_feat.shape[0]]
+        )[: tgt_feat.shape[0]]
 
-        tgt_xyz = self.folding(grid, tgt_feat)
-        tgt_xyz = self.refiner(tgt_xyz, tgt_feat)
-
-        # ================= Merge =================
-        return torch.cat([ctx_xyz_out, tgt_xyz], dim=0)
+        tgt_xyz_f = self.folding(grid, tgt_feat)
+        tgt_xyz_f = self.refiner(tgt_xyz_f, tgt_feat)
+        # ==================================================
+        # Merge
+        # ==================================================
+        out = torch.cat([ctx_xyz_out, tgt_xyz_f], dim=0)
+        return out

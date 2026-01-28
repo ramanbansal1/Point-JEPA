@@ -186,7 +186,7 @@ def train_jepa(
 
 if __name__=='__main__':
     data_config = ModelNetConfig()
-    train_cinfig = TrainConfig()
+    train_config = TrainConfig()
     dataset = ModelNetDataset(data_config)
     model = DualEncoder()
-    train_jepa(model, dataset, train_cinfig)
+    train_jepa(model, dataset, train_config)

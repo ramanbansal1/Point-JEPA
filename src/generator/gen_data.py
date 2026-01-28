@@ -11,7 +11,7 @@ import trimesh
 # ==================================================
 @dataclass
 class ModelNetConfig:
-    root: str = "data"
+    root: str = "../data"
     split: Literal["train", "val", "test"] = "train"
 
     # canonicalization
