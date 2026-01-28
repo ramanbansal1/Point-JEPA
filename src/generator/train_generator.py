@@ -7,8 +7,8 @@ from tqdm import tqdm
 import logging
 
 from pytorch3d.ops import knn_points
-from models import DualEncoder
-from gen_data import ModelNetDataset, ModelNetConfig
+from encoder.models import DualEncoder
+from generator.gen_data import ModelNetDataset, ModelNetConfig
 from generator import PointGenerator
 logging.getLogger("trimesh").setLevel(logging.ERROR)
 
