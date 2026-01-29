@@ -7,12 +7,13 @@ import torch
 from torch.utils.data import Dataset
 import trimesh
 from sklearn.neighbors import NearestNeighbors
-
+import logging
+logging.getLogger("trimesh").setLevel(logging.ERROR)
 
 @dataclass
 class ModelNetConfig:
     # Data
-    root: str = "data"
+    root: str = "../data"
     split: str = "train"
 
     # Sampling

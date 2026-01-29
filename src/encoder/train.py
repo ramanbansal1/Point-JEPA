@@ -5,7 +5,7 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from pytorch3d.ops.knn import knn_points
 from encoder.models import DualEncoder
-from data import ModelNetDataset, ModelNetConfig, jepa_collate_fn
+from encoder.data import ModelNetDataset, ModelNetConfig, jepa_collate_fn
 from tqdm import tqdm
 from utils import save_checkpoint
 
