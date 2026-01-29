@@ -104,22 +104,63 @@ def sample_halfspace_mask(pc: np.ndarray, dir_id: int, min_points=64):
 # Dataset (SINGLE MASK, CONTEXT + TARGET)
 # ==================================================
 class ModelNetDataset(Dataset):
-    def __init__(self, cfg: ModelNetConfig):
+    def __init__(self, cfg: ModelNetConfig, samples_per_class: int = 100):
         self.cfg = cfg
-        self.mesh_paths = []
+        self.samples_per_class = samples_per_class
+
+        self.allowed_classes = {
+            "bed",
+            "chair",
+            "desk",
+            "table",
+            "bookshelf",
+        }
+
+        # collect all mesh paths per class
+        self.files_by_class = {}
 
         for cls in sorted(os.listdir(cfg.root)):
+            if cls not in self.allowed_classes:
+                continue
+
             cls_path = os.path.join(cfg.root, cls, cfg.split)
             if not os.path.isdir(cls_path):
                 continue
-            for f in os.listdir(cls_path):
-                if f.endswith(".off"):
-                    self.mesh_paths.append(os.path.join(cls_path, f))
 
-        assert len(self.mesh_paths) > 0
+            files = [
+                os.path.join(cls_path, f)
+                for f in os.listdir(cls_path)
+                if f.endswith(".off")
+            ]
+
+            if len(files) == 0:
+                continue
+
+            self.files_by_class[cls] = sorted(files)
+
+        assert len(self.files_by_class) == len(self.allowed_classes), \
+            "Some required classes are missing from the dataset."
+
+        # active subset used by DataLoader
+        self.mesh_paths = []
+        self.resample_subset()
+
+    def resample_subset(self):
+        """
+        Sample exactly `samples_per_class` meshes per class.
+        Call once per epoch if desired.
+        """
+        self.mesh_paths = []
+
+        for cls, files in self.files_by_class.items():
+            k = min(self.samples_per_class, len(files))
+            chosen = np.random.choice(files, size=k, replace=False)
+            self.mesh_paths.extend(chosen)
+
+        np.random.shuffle(self.mesh_paths)
 
     def __len__(self):
-        return len(self.mesh_paths)
+        return len(self.mesh_paths)  # = 5 * 100 = 500
 
     def load_mesh(self, path):
         mesh = trimesh.load(path, process=False)
@@ -156,7 +197,6 @@ class ModelNetDataset(Dataset):
         )
 
         if mask is None:
-            # fallback: random split
             perm = np.random.permutation(len(pc))
             ctx = pc[perm[: self.cfg.num_context_points]]
             tgt = pc[perm[self.cfg.num_context_points :]]
@@ -173,57 +213,3 @@ class ModelNetDataset(Dataset):
             "mask_center": torch.from_numpy(center).float(),
             "dir_id": dir_id,
         }
-
-# ==================================================
-# Visualization Utilities (Context / Target / Mask)
-# ==================================================
-import random
-
-def _rand_color():
-    return np.array([
-        random.uniform(0.2, 1.0),
-        random.uniform(0.2, 1.0),
-        random.uniform(0.2, 1.0),
-        1.0,
-    ])
-
-
-def points_to_trimesh(pc, color):
-    cloud = trimesh.points.PointCloud(pc)
-    cloud.colors = np.tile((color * 255).astype(np.uint8), (len(pc), 1))
-    return cloud
-
-
-def sphere_at(center, radius=0.03, color=(255, 0, 0, 255)):
-    sphere = trimesh.creation.icosphere(radius=radius, subdivisions=2)
-    sphere.apply_translation(center)
-    sphere.visual.vertex_colors = np.tile(color, (len(sphere.vertices), 1))
-    return sphere
-
-
-def visualize_sample(sample):
-    """
-    sample from ModelNetDataset
-    {
-        context_xyz : [Nc, 3]
-        target_xyz  : [Nt, 3]
-        mask_center : [3]
-        dir_id      : int
-    }
-    """
-    scene = trimesh.Scene()
-
-    ctx = sample["context_xyz"]
-    tgt = sample["target_xyz"]
-    center = sample["mask_center"]
-    print(len(tgt))
-
-    if torch.is_tensor(ctx): ctx = ctx.cpu().numpy()
-    if torch.is_tensor(tgt): tgt = tgt.cpu().numpy()
-    if torch.is_tensor(center): center = center.cpu().numpy()
-
-    scene.add_geometry(points_to_trimesh(ctx, np.array([0.7, 0.7, 0.7, 1.0])))
-    scene.add_geometry(points_to_trimesh(tgt, _rand_color()))
-    scene.add_geometry(sphere_at(center))
-
-    scene.show()

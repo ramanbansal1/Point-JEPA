@@ -94,6 +94,7 @@ def train(
     pbar = tqdm(total=cfg.max_iters, desc="Training generator (FAST)")
 
     while step < cfg.max_iters:
+        dataset.resample_subset()
         for batch in loader:
             if step >= cfg.max_iters:
                 break
