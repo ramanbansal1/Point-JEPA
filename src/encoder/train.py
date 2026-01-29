@@ -7,6 +7,9 @@ from encoder.models import DualEncoder
 from encoder.data import ModelNetDataset, ModelNetConfig, jepa_collate_fn
 from tqdm import tqdm
 from utils import save_checkpoint, knn_points
+import logging
+
+logging.getLogger("trimesh").setLevel(logging.ERROR)
 
 @dataclass
 class TrainConfig:
@@ -20,10 +23,10 @@ class TrainConfig:
     eps: float = 1e-7
 
     # training
-    max_iters: int = 2_000
-    batch_size: int = 8
-    num_workers: int = 4
-    device: str = "cpu"
+    max_iters: int = 100
+    batch_size: int = 40
+    num_workers: int = 2
+    device: str = "cuda"
 
     # EMA (JEPA)
     ema_decay: float = 0.99
@@ -108,14 +111,7 @@ def train_jepa(
     model.to(device)
     model.train()
 
-    loader = DataLoader(
-        dataset,
-        batch_size=cfg.batch_size,
-        shuffle=True,
-        num_workers=cfg.num_workers,
-        drop_last=True,
-        collate_fn=jepa_collate_fn,
-    )
+
 
     optimizer = torch.optim.AdamW(
         model.parameters(),
@@ -131,6 +127,15 @@ def train_jepa(
     step = 0
 
     while step < cfg.max_iters:
+        dataset.resample_subset()
+        loader = DataLoader(
+            dataset,
+            batch_size=cfg.batch_size,
+            shuffle=True,
+            num_workers=cfg.num_workers,
+            drop_last=True,
+            collate_fn=jepa_collate_fn,
+        )
         pbar = tqdm(loader, desc=f"JEPA training", leave=False)
         for batch in pbar:
             if batch is None:
@@ -176,8 +181,8 @@ def train_jepa(
                 loss=f"{loss.item():.4f}"
             )
 
-        
-        save_checkpoint(model, step)
+
+            save_checkpoint(model, step)
 
 
         step += 1
@@ -185,7 +190,7 @@ def train_jepa(
 
 if __name__=='__main__':
     data_config = ModelNetConfig()
-    train_config = TrainConfig()
+    train_cinfig = TrainConfig()
     dataset = ModelNetDataset(data_config)
     model = DualEncoder()
-    train_jepa(model, dataset, train_config)
+    train_jepa(model, dataset, train_cinfig)

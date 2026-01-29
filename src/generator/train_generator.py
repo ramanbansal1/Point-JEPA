@@ -20,7 +20,7 @@ class TrainConfig:
     lr: float = 3e-4
     weight_decay: float = 0.01
 
-    max_iters: int = 20_000
+    max_iters: int = 200
     batch_size: int = 8
     num_workers: int = 4
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
@@ -158,8 +158,8 @@ def train(
             # ----------------------------
             pbar.set_postfix(loss=f"{loss.item():.4f}")
 
-            step += 1
             pbar.update(1)
+        step += 1
 
     pbar.close()
 

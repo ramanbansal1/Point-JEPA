@@ -281,19 +281,55 @@ def generate_jepa_masks(
     return context_pc, target_pcs, centers
 
 class ModelNetDataset(Dataset):
-    def __init__(self, config: ModelNetConfig):
+    def __init__(self, config: ModelNetConfig, samples_per_class=100):
         self.cfg = config
-        self.mesh_paths = []
+        self.samples_per_class = samples_per_class
+
+        self.allowed_classes = {
+            "bed", "chair", "desk", "table", "bookshelf"
+        }
+
+        # store all files per class
+        self.files_by_cat = {}
 
         for cls in sorted(os.listdir(config.root)):
+            if cls not in self.allowed_classes:
+                continue
+
             cls_path = os.path.join(config.root, cls, config.split)
             if not os.path.isdir(cls_path):
                 continue
-            for f in os.listdir(cls_path):
-                if f.endswith(".off"):
-                    self.mesh_paths.append(os.path.join(cls_path, f))
 
-        assert len(self.mesh_paths) > 0
+            files = [
+                os.path.join(cls_path, f)
+                for f in os.listdir(cls_path)
+                if f.endswith(".off")
+            ]
+
+            if len(files) == 0:
+                continue
+
+            self.files_by_cat[cls] = sorted(files)
+
+        assert len(self.files_by_cat) == len(self.allowed_classes)
+
+        # active subset used by DataLoader
+        self.mesh_paths = []
+        self.resample_subset()
+
+    def resample_subset(self):
+        """
+        Sample exactly N meshes per class.
+        Call once per epoch.
+        """
+        self.mesh_paths = []
+
+        for cls, files in self.files_by_cat.items():
+            k = min(self.samples_per_class, len(files))
+            chosen = np.random.choice(files, size=k, replace=False)
+            self.mesh_paths.extend(chosen)
+
+        random.shuffle(self.mesh_paths)
 
     def __len__(self):
         return len(self.mesh_paths)
@@ -398,93 +434,3 @@ def jepa_collate_fn(batch):
         print(f"[WARN] Dropping batch in collate_fn: {e}")
         return None
 
-
-import numpy as np
-import trimesh
-import torch
-import random
-
-
-# -----------------------------
-# Color utilities
-# -----------------------------
-def random_color():
-    return np.array([
-        random.uniform(0.2, 1.0),
-        random.uniform(0.2, 1.0),
-        random.uniform(0.2, 1.0),
-        1.0
-    ])
-
-
-# -----------------------------
-# Trimesh helpers
-# -----------------------------
-def points_to_trimesh(pc, color, size=0.005):
-    """
-    pc: (N, 3) numpy
-    color: (4,) RGBA
-    """
-    cloud = trimesh.points.PointCloud(pc)
-    cloud.colors = np.tile((color * 255).astype(np.uint8), (len(pc), 1))
-    return cloud
-
-
-def sphere_at(center, radius=0.03, color=(255, 0, 0, 255)):
-    sphere = trimesh.creation.icosphere(radius=radius, subdivisions=2)
-    sphere.apply_translation(center)
-    sphere.visual.vertex_colors = np.tile(color, (len(sphere.vertices), 1))
-    return sphere
-
-
-# -----------------------------
-# Main visualization
-# -----------------------------
-def visualize_jepa_sample(sample):
-    """
-    sample: output of ModelNetDataset.__getitem__()
-    """
-    scene = trimesh.Scene()
-
-    # ---- Context ----
-    context = sample["context"]
-    if torch.is_tensor(context):
-        context = context.cpu().numpy()
-
-    context_cloud = points_to_trimesh(
-        context,
-        color=np.array([0.75, 0.75, 0.75, 1.0])
-    )
-    scene.add_geometry(context_cloud)
-
-    # ---- Targets ----
-    for tgt in sample["targets"]:
-        pc = tgt["pcd"]
-        center = tgt["center"]
-
-        if torch.is_tensor(pc):
-            pc = pc.cpu().numpy()
-        if torch.is_tensor(center):
-            center = center.cpu().numpy()
-
-        color = random_color()
-
-        tgt_cloud = points_to_trimesh(pc, color=color)
-        scene.add_geometry(tgt_cloud)
-
-        center_sphere = sphere_at(center)
-        scene.add_geometry(center_sphere)
-
-    scene.show()
-
-
-# -----------------------------
-# Example usage
-# -----------------------------
-if __name__ == "__main__":
-
-    cfg = ModelNetConfig()
-    dataset = ModelNetDataset(cfg)
-
-    sample = dataset[10]
-    visualize_jepa_sample(sample)
