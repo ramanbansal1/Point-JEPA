@@ -3,12 +3,13 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 import copy
-from pytorch3d.ops import (
+
+from utils import (
+    fourier_features_3d,
     sample_farthest_points,
     ball_query,
     knn_points,
 )
-from utils import fourier_features_3d
 
 
 class PointNetBlock(nn.Module):

@@ -6,7 +6,6 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 import logging
 
-from pytorch3d.ops import knn_points
 from encoder.models import DualEncoder
 from generator.gen_data import ModelNetDataset, ModelNetConfig
 from generator.test_model import PointGenerator
@@ -33,7 +32,6 @@ class TrainConfig:
 # FPS-based Hierarchical Chamfer (FAST + STABLE)
 # ==================================================
 
-from pytorch3d.ops import sample_farthest_points
 
 
 def chamfer_cdist(x, y):
@@ -176,7 +174,7 @@ if __name__ == "__main__":
     dataset = ModelNetDataset(data_cfg)
 
     encoder = DualEncoder()
-    ckpt = torch.load("/home/raman/Desktop/Projects/Point-JEPA/checkpoints/jepa_step_4_.pt", map_location="cpu")
+    ckpt = torch.load("../checkpoints/jepa_step_4_.pt", map_location="cpu")
     encoder.load_state_dict(ckpt, strict=False)
 
     generator = PointGenerator(token_dim=data_cfg.token_dim)
