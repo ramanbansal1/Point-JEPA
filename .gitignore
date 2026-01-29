@@ -1,6 +1,4 @@
 data/
-pytorch3d/
-
 app/external/
 app/depth_anything_v2/
 
