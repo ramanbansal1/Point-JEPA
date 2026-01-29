@@ -9,6 +9,7 @@ import logging
 from encoder.models import DualEncoder
 from generator.gen_data import ModelNetDataset, ModelNetConfig
 from generator.test_model import PointGenerator
+import os
 
 logging.getLogger("trimesh").setLevel(logging.ERROR)
 
@@ -20,12 +21,12 @@ class TrainConfig:
     lr: float = 3e-4
     weight_decay: float = 0.01
 
-    max_iters: int = 200
+    max_iters: int = 30
     batch_size: int = 8
     num_workers: int = 4
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
 
-    log_every: int = 50
+    log_every: int = 5
 
 
 # ==================================================
@@ -60,6 +61,8 @@ def train(
     dataset: ModelNetDataset,
     cfg: TrainConfig,
 ):
+    os.makedirs("checkpoints", exist_ok=True)
+
     device = torch.device(cfg.device)
     # ----------------------------
     # Encoder: frozen teacher
@@ -91,11 +94,11 @@ def train(
     )
 
     step = 0
-    pbar = tqdm(total=cfg.max_iters, desc="Training generator (FAST)")
 
     while step < cfg.max_iters:
         dataset.resample_subset()
-        for batch in loader:
+        pbar = tqdm(loader, desc="Training generator (FAST)")
+        for batch in pbar:
             if step >= cfg.max_iters:
                 break
 
@@ -154,15 +157,34 @@ def train(
             torch.nn.utils.clip_grad_norm_(generator.parameters(), 1.0)
             optimizer.step()
 
+            if step % cfg.log_every == 0:
+                torch.save(
+                    {
+                        "step": step,
+                        "generator_state": generator.state_dict(),
+                        "optimizer_state": optimizer.state_dict(),
+                        "loss": loss.item(),
+                    },
+                    f"checkpoints/generator_step_{step}.pt",
+                )
+
             # ----------------------------
             # Logging
             # ----------------------------
             pbar.set_postfix(loss=f"{loss.item():.4f}")
 
-            pbar.update(1)
         step += 1
-
     pbar.close()
+
+    torch.save(
+        {
+            "step": step,
+            "generator_state": generator.state_dict(),
+            "optimizer_state": optimizer.state_dict(),
+        },
+        "checkpoints/generator_final.pt",
+    )
+
 
 
 # ==================================================
