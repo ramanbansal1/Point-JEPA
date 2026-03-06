@@ -30,10 +30,9 @@ class ModelNetConfig:
     min_points: int = 64
 
 MASK_PROBS = {
-    "box": 0.50,
-    "ball": 0.20,
+    "box": .45,
+    "ball": 0.35,
     "strip": 0.20,
-    "half": 0.10,
 }
 
 
@@ -44,7 +43,7 @@ def normalize_pc(pc):
     return pc
 
 
-def sample_ball_mask(pc, radius_ratio_range=(0.15, 0.2)):
+def sample_ball_mask(pc, radius_ratio_range=(0.06, 0.12)):
     """
     pc: (N, 3) normalized point cloud
     returns: mask (N,) boolean
@@ -66,8 +65,8 @@ def sample_ball_mask(pc, radius_ratio_range=(0.15, 0.2)):
 def sample_box_mask(
     pc,
     center,
-    scale_range=(0.2, 0.35),
-    aspect_ratio_range=(0.75, 1.5),
+    scale_range = (0.08, 0.18),
+    aspect_ratio_range = (0.6, 1.3)
 ):
     """
     Axis-aligned anisotropic box
@@ -91,10 +90,10 @@ def sample_box_mask(
 def sample_strip_masks(
     pc,
     available,
-    num_strips=(2, 4),
-    width_ratio=(0.03, 0.08),
+    num_strips=(2, 10),
+    width_ratio = (0.02, 0.05),
     min_points=64,
-    max_total_ratio=0.45,
+    max_total_ratio=0.25,
 ):
     N = len(pc)
     obj_scale = np.max(np.linalg.norm(pc, axis=1))
@@ -286,7 +285,7 @@ class ModelNetDataset(Dataset):
         self.samples_per_class = samples_per_class
 
         self.allowed_classes = {
-            "bed", "chair", "desk", "table", "bookshelf"
+            "bathtub"
         }
 
         # store all files per class
@@ -395,42 +394,189 @@ class ModelNetDataset(Dataset):
 
 
 
-def jepa_collate_fn(batch):
+
+
+import torch
+import math
+
+
+def random_rotation_matrix():
+    """Uniform random SO(3) rotation"""
+    a, b, c = torch.rand(3) * 2 * math.pi
+
+    Rx = torch.tensor([
+        [1, 0, 0],
+        [0, torch.cos(a), -torch.sin(a)],
+        [0, torch.sin(a), torch.cos(a)],
+    ])
+
+    Ry = torch.tensor([
+        [torch.cos(b), 0, torch.sin(b)],
+        [0, 1, 0],
+        [-torch.sin(b), 0, torch.cos(b)],
+    ])
+
+    Rz = torch.tensor([
+        [torch.cos(c), -torch.sin(c), 0],
+        [torch.sin(c), torch.cos(c), 0],
+        [0, 0, 1],
+    ])
+
+    return Rz @ Ry @ Rx
+
+
+def augment_pc(pc, R, scale, noise_std=0.005):
+    """
+    pc: [N, 3]
+    """
+    pc = pc @ R.T
+    pc = pc * scale
+    pc = pc + torch.randn_like(pc) * noise_std
+    return pc
+
+
+def jepa_collate_fn(batch, augment=True):
     contexts = []
     all_targets = []
     all_centers = []
 
-    try:
-        # infer expected context size from first valid sample
-        expected_N = batch[0]["context"].shape[0]
+    # infer expected context size
+    expected_N = batch[0]["context"].shape[0]
 
-        for sample in batch:
-            ctx = sample["context"]
+    for sample in batch:
+        ctx = sample["context"]
 
-            # ---- HARD CHECK ----
-            if ctx.shape[0] != expected_N:
-                raise ValueError(
-                    f"context size mismatch: {ctx.shape[0]} vs {expected_N}"
-                )
+        # ---- HARD CHECK ----
+        if ctx.shape[0] != expected_N:
+            raise ValueError(
+                f"context size mismatch: {ctx.shape[0]} vs {expected_N}"
+            )
 
-            contexts.append(ctx)
+        # ---- Sample-level augmentation ----
+        if augment:
+            R = random_rotation_matrix().to(ctx.device)
+            scale = torch.empty(1).uniform_(0.9, 1.1).item()
 
-            targets = sample["targets"]
-            pcs = [t["pcd"] for t in targets]
-            centers = [t["center"] for t in targets]
+            ctx = augment_pc(ctx, R, scale)
 
-            all_targets.append(pcs)
-            all_centers.append(torch.stack(centers))
+        contexts.append(ctx)
 
-        return {
-            "context": torch.stack(contexts),         # [B, Nc, 3]
-            "targets": all_targets,                   # list[B][M][Ni,3]
-            "mask_centers": torch.stack(all_centers), # [B, M, 3]
-        }
+        pcs = []
+        centers = []
 
-    except Exception as e:
-        # ---- DROP THIS BATCH ----
-        # returning None tells DataLoader to skip it
-        print(f"[WARN] Dropping batch in collate_fn: {e}")
-        return None
+        for t in sample["targets"]:
+            pc = t["pcd"]
+            center = t["center"]
 
+            if augment:
+                pc = augment_pc(pc, R, scale)
+                center = center @ R.T
+                center = center * scale
+
+            pcs.append(pc)
+            centers.append(center)
+
+        all_targets.append(pcs)
+        all_centers.append(torch.stack(centers))
+
+    return {
+        "context": torch.stack(contexts),         # [B, Nc, 3]
+        "targets": all_targets,                   # list[B][M][Ni,3]
+        "mask_centers": torch.stack(all_centers), # [B, M, 3]
+    }
+
+
+import trimesh
+import numpy as np
+import random
+
+
+def visualize_jepa_sample_trimesh(
+    sample,
+    show_boxes=True,
+    point_size=3,
+):
+    """
+    sample: output of ModelNetDataset[i]
+      {
+        "context": Tensor [Nc, 3],
+        "targets": list of dicts:
+            {
+              "pcd": Tensor [Ni, 3],
+              "center": Tensor [3]
+            }
+      }
+    """
+
+    scene = trimesh.Scene()
+
+    # -----------------------------
+    # Context (BLUE)
+    # -----------------------------
+    ctx = sample["context"].cpu().numpy()
+    ctx_colors = np.tile([50, 100, 255, 255], (len(ctx), 1))
+    scene.add_geometry(
+        trimesh.points.PointCloud(ctx, colors=ctx_colors),
+        geom_name="context",
+    )
+
+    # -----------------------------
+    # Targets (DISTINCT COLORS)
+    # -----------------------------
+    color_pool = [
+        [255, 80, 80, 255],
+        [80, 255, 80, 255],
+        [255, 200, 50, 255],
+        [200, 80, 255, 255],
+        [80, 255, 255, 255],
+    ]
+
+    for i, t in enumerate(sample["targets"]):
+        pc = t["pcd"].cpu().numpy()
+        center = t["center"].cpu().numpy()
+
+        color = color_pool[i % len(color_pool)]
+        colors = np.tile(color, (len(pc), 1))
+
+        scene.add_geometry(
+            trimesh.points.PointCloud(pc, colors=colors),
+            geom_name=f"target_{i}",
+        )
+
+        # -----------------------------
+        # Mask center (SPHERE)
+        # -----------------------------
+        sphere = trimesh.creation.icosphere(
+            radius=0.02,
+            subdivisions=2,
+        )
+        sphere.apply_translation(center)
+        sphere.visual.vertex_colors = [0, 0, 0, 255]
+
+        scene.add_geometry(
+            sphere,
+            geom_name=f"center_{i}",
+        )
+
+        # -----------------------------
+        # Optional bounding box
+        # -----------------------------
+        if show_boxes and len(pc) > 10:
+            bounds = np.stack([pc.min(axis=0), pc.max(axis=0)])
+            box = trimesh.creation.box(
+                extents=bounds[1] - bounds[0]
+            )
+            box.apply_translation(bounds.mean(axis=0))
+            box.visual.face_colors = [0, 0, 0, 40]
+
+            scene.add_geometry(
+                box,
+                geom_name=f"bbox_{i}",
+            )
+
+    scene.show()
+if __name__=='__main__':
+    dataset = ModelNetDataset(ModelNetConfig())
+    sample = dataset[0]
+
+    visualize_jepa_sample_trimesh(sample)

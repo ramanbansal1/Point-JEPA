@@ -8,7 +8,7 @@ from encoder.data import ModelNetDataset, ModelNetConfig, jepa_collate_fn
 from tqdm import tqdm
 from utils import save_checkpoint, knn_points
 import logging
-
+import matplotlib.pyplot as plt
 logging.getLogger("trimesh").setLevel(logging.ERROR)
 
 @dataclass
@@ -23,10 +23,10 @@ class TrainConfig:
     eps: float = 1e-7
 
     # training
-    max_iters: int = 100
+    max_iters: int = 10
     batch_size: int = 40
     num_workers: int = 2
-    device: str = "cuda"
+    device: str = "cuda" if torch.cuda.is_available() else 'cpu'
 
     # EMA (JEPA)
     ema_decay: float = 0.99
@@ -100,6 +100,65 @@ def jepa_loss(pred_tokens, target_tokens, ctx_xyz, tgt_xyz):
             count += 1
 
     return loss / count
+
+@torch.no_grad()
+def compute_pointwise_jepa_error(
+    pred_tokens, target_tokens, ctx_xyz, tgt_xyz
+):
+    """
+    Returns:
+        xyz   : [P_ctx, 3]
+        error : [P_ctx]
+    Uses only first sample in batch and first mask (for visualization)
+    """
+
+    # take first batch element, first mask
+    pred_tok = pred_tokens[0, 0]       # [P_ctx, C]
+    tgt_tok  = target_tokens[0][0]     # [P_t', C]
+    ctx_pts  = ctx_xyz[0]              # [P_ctx, 3]
+    tgt_pts  = tgt_xyz[0][0]            # [P_t', 3]
+
+    # align target tokens to context points
+    _, idx, _ = knn_points(
+        ctx_pts.unsqueeze(0),
+        tgt_pts.unsqueeze(0),
+        K=1,
+    )
+    idx = idx.squeeze(0).squeeze(-1)    # [P_ctx]
+
+    aligned_tgt = tgt_tok[idx]          # [P_ctx, C]
+
+    # L2 error per point
+    error = (pred_tok - aligned_tgt).pow(2).mean(dim=1)
+
+    return ctx_pts.detach().cpu(), error.detach().cpu()
+
+
+def plot_context_with_error(xyz, error, step):
+    """
+    xyz   : [N, 3]
+    error : [N]
+    """
+
+    fig = plt.figure(figsize=(6, 6))
+    ax = fig.add_subplot(111, projection="3d")
+
+    p = ax.scatter(
+        xyz[:, 0],
+        xyz[:, 1],
+        xyz[:, 2],
+        c=error,
+        cmap="viridis",
+        s=20,
+    )
+
+    fig.colorbar(p, ax=ax, shrink=0.6, label="JEPA token error")
+    ax.set_title(f"Context XYZ + Token Error (step {step})")
+
+    ax.set_axis_off()
+    plt.tight_layout()
+    plt.show()
+
 
 
 def train_jepa(
@@ -183,6 +242,16 @@ def train_jepa(
 
 
             save_checkpoint(model, step)
+        # ---- Epoch-level visualization ----
+        with torch.no_grad():
+            xyz_vis, err_vis = compute_pointwise_jepa_error(
+                pred_tokens=out["pred_tokens"],
+                target_tokens=out["target_tokens"],
+                ctx_xyz=out["ctx_xyz"],
+                tgt_xyz=out["tgt_xyz"],
+            )
+
+        plot_context_with_error(xyz_vis, err_vis, step)
 
 
         step += 1
@@ -193,4 +262,6 @@ if __name__=='__main__':
     train_cinfig = TrainConfig()
     dataset = ModelNetDataset(data_config)
     model = DualEncoder()
+    state_dict = torch.load('checkpoints/jepa_step_9.pt')
+    model.load_state_dict(state_dict)
     train_jepa(model, dataset, train_cinfig)

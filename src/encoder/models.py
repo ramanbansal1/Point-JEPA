@@ -8,7 +8,6 @@ from utils import (
     fourier_features_3d,
     sample_farthest_points,
     ball_query,
-    knn_points,
 )
 
 
@@ -31,62 +30,7 @@ class PointNetBlock(nn.Module):
         x = self.mlp(x)
         x = torch.max(x, dim=2)[0]  # max over K neighbors
         return x  # [B, C_out, N]
-"""
-class SetAbstraction(nn.Module):
-    def __init__(self, npoint, radius, nsample, in_channels, mlp_channels):
-        super().__init__()
-        self.npoint = npoint
-        self.radius = radius
-        self.nsample = nsample
-        self.pointnet = PointNetBlock(in_channels + 3, mlp_channels)
 
-    def forward(self, xyz, features):
-        ""
-        xyz: [B, N, 3]
-        features: [B, C, N] or None
-        ""
-        B, N, _ = xyz.shape
-
-        # FPS
-        new_xyz, fps_idx = sample_farthest_points(xyz, K=self.npoint)
-
-        # Ball query
-        _, idx, _ = ball_query(
-            new_xyz, xyz,
-            radius=self.radius,
-            K=self.nsample,
-            return_nn=False,
-        )
-
-        idx[idx < 0] = 0
-
-
-        grouped_xyz = xyz[:, None].expand(-1, self.npoint, -1, -1)
-        grouped_xyz = torch.gather(
-            grouped_xyz, 2, idx[..., None].expand(-1, -1, -1, 3)
-        )
-        grouped_xyz = grouped_xyz - new_xyz[:, :, None, :]
-        grouped_xyz = grouped_xyz.permute(0, 3, 2, 1)
-
-        if features is not None:
-            grouped_features = features.unsqueeze(2).expand(
-                -1, -1, self.npoint, -1
-            )
-            grouped_features = torch.gather(
-                grouped_features,
-                3,
-                idx[:, None].expand(-1, features.shape[1], -1, -1)
-            )
-            grouped_features = grouped_features.permute(0, 1, 3, 2)
-
-            grouped = torch.cat([grouped_xyz, grouped_features], dim=1)
-
-        else:
-            grouped = grouped_xyz.permute(0, 3, 2, 1)
-
-        new_features = self.pointnet(grouped)
-        return new_xyz, new_features
-"""
 class SetAbstraction(nn.Module):
     def __init__(self, npoint, radius, nsample, in_channels, mlp_channels):
         super().__init__()
@@ -170,19 +114,20 @@ class Encoder(nn.Module):
         super().__init__()
 
         self.sa1 = SetAbstraction(
-            npoint=512, radius=0.1, nsample=32,
-            in_channels=0, mlp_channels=[latent_dim // 16, latent_dim // 16, latent_dim // 8]
+            npoint=256, radius=0.15, nsample=24,
+            in_channels=0, mlp_channels=[64, 64, 128]
         )
 
         self.sa2 = SetAbstraction(
-            npoint=128, radius=0.25, nsample=64,
-            in_channels=128, mlp_channels=[latent_dim // 8, latent_dim // 8, latent_dim // 4]
+            npoint=64, radius=0.3, nsample=48,
+            in_channels=128, mlp_channels=[128, 128, 256]
         )
 
         self.sa3 = SetAbstraction(
-            npoint=32, radius=0.5, nsample=128,
-            in_channels=256, mlp_channels=[latent_dim // 4, latent_dim // 2, latent_dim]
+            npoint=32, radius=0.6, nsample=64,
+            in_channels=256, mlp_channels=[256, 512, 1024]
         )
+
 
     def forward(self, xyz):
         """
@@ -346,83 +291,15 @@ class DualEncoder(nn.Module):
             tgt_param.data.mul_(self.ema_decay)
             tgt_param.data.add_((1.0 - self.ema_decay) * ctx_param.data)
 
-def upsample_repeat(xyz, r, noise_std=0.01):
-    """
-    xyz: [B, P, 3]
-    returns: [B, r*P, 3]
-    """
-    B, P, _ = xyz.shape
-    xyz = xyz.unsqueeze(2).repeat(1, 1, r, 1)   # [B, P, r, 3]
-    xyz = xyz.reshape(B, P * r, 3)              # [B, rP, 3]
-    xyz = xyz + noise_std * torch.randn_like(xyz)
-    return xyz
-
-
-def assign_tokens(xyz, anchor_xyz, anchor_tokens):
-    """
-    xyz            : [B, Q, 3]
-    anchor_xyz     : [B, P, 3]
-    anchor_tokens  : [B, P, C]
-
-    returns        : [B, Q, C]
-    """
-    _, idx, _ = knn_points(xyz, anchor_xyz, K=1)   # [B, Q, 1]
-    idx = idx.squeeze(-1)                          # [B, Q]
-
-    B, Q = idx.shape
-    C = anchor_tokens.shape[-1]
-
-    tokens = torch.gather(
-        anchor_tokens,
-        dim=1,
-        index=idx.unsqueeze(-1).expand(B, Q, C)
-    )
-    return tokens
-
-
-
-class RecursivePointGenerator(nn.Module):
-    def __init__(
-        self,
-        latent_dim=1024,
-        upsample_factors=(6, 4, 4),  # 32 → . → . → 3072
-    ):
-        super().__init__()
-
-        self.upsample_factors = upsample_factors
-
-        # simple deformation MLP
-        self.deformer = nn.Sequential(
-            nn.Linear(latent_dim, latent_dim),
-            nn.ReLU(inplace=True),
-            nn.Linear(latent_dim, 3),
-        )
-
-    def forward(self, ctx_xyz, pred_tokens):
+    def encode_xyz_only(self, xyz):
         """
-        ctx_xyz     : [B, 32, 3]
-        pred_tokens : [B, M, 32, C]
-
-        returns     : [B, 3072, 3]
+        xyz: [B, N, 3]
+        returns: [B, 32, D]
         """
+        out = self.context_encoder(xyz)
 
-        # ---- collapse mask dimension ----
-        tokens = pred_tokens.mean(dim=1)   # [B, 32, C]
-        xyz = ctx_xyz                      # [B, 32, 3]
+        # level3 features: [B, C, 32]
+        tokens = out["level3"]["feat"]
 
-        for r in self.upsample_factors:
-            # 1. upsample
-            xyz = upsample_repeat(xyz, r)  # [B, Q, 3]
-
-            # 2. assign tokens
-            point_tokens = assign_tokens(
-                xyz,
-                ctx_xyz,
-                tokens
-            )                               # [B, Q, C]
-
-            # 3. deform
-            delta = self.deformer(point_tokens)  # [B, Q, 3]
-            xyz = xyz + delta
-
-        return xyz
+        # transpose to [B, 32, C]
+        return tokens.transpose(1, 2)
